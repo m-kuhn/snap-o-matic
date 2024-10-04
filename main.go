@@ -146,15 +146,6 @@ func loadConfig(filename string, cfg *config) error {
 	return decoder.Decode(cfg)
 }
 
-// Get the API endpoint
-func getAPIEndpoint() v3.Endpoint {
-	endpoint := os.Getenv("EXOSCALE_API_ENDPOINT")
-	if endpoint == "" {
-		return defaultEndpoint // default to predefined endpoint
-	}
-	return v3.Endpoint(endpoint)
-}
-
 // Process a specific instance by creating snapshots and managing retention
 func processInstance(ctx context.Context, client *v3.Client, instance InstanceConfig, dryRun bool) error {
 	fmt.Printf("Processing instance: %s\n", instance.ID)
@@ -306,6 +297,15 @@ func deleteSnapshot(ctx context.Context, client *v3.Client, snapshot v3.Snapshot
 			}
 		}
 	}
+}
+
+// Get the API endpoint
+func getAPIEndpoint() v3.Endpoint {
+	endpoint := os.Getenv("EXOSCALE_API_ENDPOINT")
+	if endpoint == "" {
+		return defaultEndpoint // default to predefined endpoint
+	}
+	return v3.Endpoint(endpoint)
 }
 
 // apiCredentialsFromFile parses a file containing the API credentials.
