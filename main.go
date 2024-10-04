@@ -7,28 +7,41 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"slices"
+	"sort"
 	"strings"
-
-	flag "github.com/spf13/pflag"
+	"time"
 
 	v3 "github.com/exoscale/egoscale/v3"
 	"github.com/exoscale/egoscale/v3/credentials"
-	exometa "github.com/exoscale/egoscale/v3/metadata"
+	"gopkg.in/yaml.v3" // YAML parsing using yaml.v3
+
+	flag "github.com/spf13/pflag"
 )
 
 const (
-	defaultSnapshotsRetention = 7
-	defaultEndpoint           = v3.CHGva2
+	defaultEndpoint = v3.CHDk2
+	marginFactor    = 0.1 // 10% margin for timeframe flexibility
 )
 
 type config struct {
-	APIEndpoint        v3.Endpoint
-	SnapshotsRetention int
-	DryRun             bool
-	InstanceID         InstanceID
-	CredentialsFile    string
-	LogLevel           string
+	APIEndpoint     v3.Endpoint
+	DryRun          bool
+	Instances       []InstanceConfig // Multiple instances with retention policies
+	CredentialsFile string
+	LogLevel        string
+}
+
+type InstanceConfig struct {
+	ID        v3.UUID           `yaml:"id"`
+	Snapshots SnapshotRetention `yaml:"snapshots"`
+}
+
+type SnapshotRetention struct {
+	Hourly  int `yaml:"hourly"`
+	Daily   int `yaml:"daily"`
+	Weekly  int `yaml:"weekly"`
+	Monthly int `yaml:"monthly"`
+	Yearly  int `yaml:"yearly"`
 }
 
 func exitWithErr(err error) {
@@ -37,12 +50,18 @@ func exitWithErr(err error) {
 }
 
 func main() {
+	// Load config from YAML file
 	cfg := config{
-		APIEndpoint: getAPIEndpoint(),
+		APIEndpoint: getAPIEndpoint(), // Getting the API endpoint via the custom function
 	}
 
 	parseFlags(&cfg)
 
+	if err := loadConfig("config.yaml", &cfg); err != nil {
+		exitWithErr(err)
+	}
+
+	// Set log level
 	switch cfg.LogLevel {
 	case "debug":
 		slog.SetLogLoggerLevel(slog.LevelDebug)
@@ -52,6 +71,7 @@ func main() {
 		slog.SetLogLoggerLevel(slog.LevelInfo)
 	}
 
+	// Set up credentials
 	var creds *credentials.Credentials
 	if cfg.CredentialsFile != "" {
 		var err error
@@ -63,6 +83,7 @@ func main() {
 		creds = credentials.NewEnvCredentials()
 	}
 
+	fmt.Println("Using endpoint: ", cfg.APIEndpoint)
 	client, err := v3.NewClient(creds, v3.ClientOptWithEndpoint(cfg.APIEndpoint))
 	if err != nil {
 		exitWithErr(err)
@@ -70,41 +91,18 @@ func main() {
 
 	ctx := context.Background()
 
-	if err := snap(ctx, client, &cfg); err != nil {
-		exitWithErr(err)
+	// Process each instance in the config
+	for _, instance := range cfg.Instances {
+		if err := processInstance(ctx, client, instance, cfg.DryRun); err != nil {
+			exitWithErr(err)
+		}
 	}
-}
-
-type InstanceID struct {
-	UUID v3.UUID
-}
-
-func (instanceID *InstanceID) String() string {
-	return instanceID.UUID.String()
-}
-
-func (instanceID *InstanceID) Type() string {
-	return "v3.UUID"
-}
-
-func (instanceID *InstanceID) Set(v string) error {
-	parsedID, err := v3.ParseUUID(v)
-	if err != nil {
-		return fmt.Errorf("failed to parse instance ID: %w", err)
-	}
-
-	instanceID.UUID = parsedID
-
-	return nil
 }
 
 func parseFlags(cfg *config) {
 	flag.StringVarP(&cfg.CredentialsFile, "credentials-file", "f", "",
 		"File to read API credentials from")
-	flag.VarP(&cfg.InstanceID, "instance-id", "i",
-		"ID of the instance to snapshot (disables instance-local lookup)")
-	flag.IntVarP(&cfg.SnapshotsRetention, "snapshot-retention", "r", defaultSnapshotsRetention,
-		"Maximum snapshots retention")
+
 	flag.StringVarP(&cfg.LogLevel, "log-level", "L", "info", "Logging level, supported values: error,info,debug")
 	flag.BoolVarP(&cfg.DryRun, "dry-run", "d", false, "Run in dry-run mode (read-only)")
 
@@ -136,114 +134,178 @@ API credentials file format:
 	flag.Parse()
 }
 
-// rotateSnapshots lists the existing instance snapshots and deletes the oldest ones in order to remain under the
-// specified retention threshold.
-// WARNING: unlike previous versions of snap-o-matic, this will not preserve user-created snapshots
-func rotateSnapshots(ctx context.Context, client *v3.Client, cfg *config) error {
-	snapshots, err := client.ListSnapshots(ctx)
+// Load the YAML configuration file
+func loadConfig(filename string, cfg *config) error {
+	file, err := os.Open(filename)
 	if err != nil {
-		return fmt.Errorf("failed to list snapshots: %w", err)
+		return err
 	}
+	defer file.Close()
 
-	// sort in ascending order, oldest snapshot first
-	slices.SortFunc(snapshots.Snapshots, func(a, b v3.Snapshot) int {
-		return -a.CreatedAT.Compare(b.CreatedAT)
-	})
-
-	sc := 0
-	for _, snapshot := range snapshots.Snapshots {
-		if snapshot.Instance.ID != cfg.InstanceID.UUID {
-			continue
-		}
-
-		slog.Info("found snapshot", "id", snapshot.ID.String(), "created-at", snapshot.CreatedAT)
-
-		if sc++; sc < cfg.SnapshotsRetention {
-			continue
-		}
-
-		if cfg.DryRun {
-			slog.Info("[DRY-RUN] deleting snapshot", "id", snapshot.ID.String())
-
-			continue
-		}
-
-		slog.Info("deleting snapshot", "id", snapshot.ID.String(), "created-at", snapshot.CreatedAT)
-		op, err := client.DeleteSnapshot(ctx, snapshot.ID)
-		if err != nil {
-			return fmt.Errorf("failed to delete snapshot: %w", err)
-		}
-
-		slog.Info("waiting for operation to succeed", "operation-id", op.ID, "command", op.Reference.Command)
-		_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
-		if err != nil {
-			return fmt.Errorf("delete operation of snapshot did not succeed: %w", err)
-		}
-	}
-
-	return nil
+	decoder := yaml.NewDecoder(file)
+	return decoder.Decode(cfg)
 }
 
-// takeSnapshot takes a new instance snapshot
-func takeSnapshot(ctx context.Context, client *v3.Client, cfg *config) error {
-	if cfg.DryRun {
-		slog.Info("[DRY-RUN] creating snapshot")
-
-		return nil
+// Get the API endpoint
+func getAPIEndpoint() v3.Endpoint {
+	endpoint := os.Getenv("EXOSCALE_API_ENDPOINT")
+	if endpoint == "" {
+		return defaultEndpoint // default to predefined endpoint
 	}
-
-	slog.Info("creating snapshot")
-	op, err := client.CreateSnapshot(ctx, cfg.InstanceID.UUID)
-	if err != nil {
-		return fmt.Errorf("failed to create snapshot: %w", err)
-	}
-
-	slog.Info("waiting for operation to succeed", "operation-id", op.ID, "command", op.Reference.Command)
-
-	op, err = client.Wait(ctx, op, v3.OperationStateSuccess)
-	if err != nil {
-		return fmt.Errorf("delete operation of snapshot did not succeed: %w", err)
-	}
-
-	slog.Info("snapshot created successfully", "snapshot-id", op.Reference.ID)
-
-	return nil
+	return v3.Endpoint(endpoint)
 }
 
-func snap(ctx context.Context, client *v3.Client, cfg *config) error {
-	if cfg.InstanceID.UUID == "" {
-		slog.Info("looking up instance ID via metadata service")
+// Process a specific instance by creating snapshots and managing retention
+func processInstance(ctx context.Context, client *v3.Client, instance InstanceConfig, dryRun bool) error {
+	fmt.Printf("Processing instance: %s\n", instance.ID)
 
-		resp, err := exometa.Get(ctx, exometa.InstanceID)
-		if err != nil {
-			return fmt.Errorf("failed to parse instance ID: %w", err)
-		}
-
-		instanceID, err := v3.ParseUUID(resp)
-		if err != nil {
-			return fmt.Errorf("failed to parse instance ID: %w", err)
-		}
-		cfg.InstanceID.UUID = instanceID
-
-		slog.Info("defaulting to host instance", "instance-id", cfg.InstanceID)
+	// Create a new snapshot for the instance
+	snapshotID, err := createSnapshot(ctx, client, instance.ID, dryRun)
+	if err != nil {
+		return err
 	}
+	fmt.Printf("  Created snapshot: %s\n", snapshotID)
 
-	slog.Info("settings", "config", *cfg)
-
-	if err := rotateSnapshots(ctx, client, cfg); err != nil {
+	// Get and manage snapshots based on retention policies
+	snapshots, err := getSnapshots(ctx, client, instance.ID)
+	if err != nil {
 		return err
 	}
 
-	return takeSnapshot(ctx, client, cfg)
+	// Step 1: Categorize snapshots into their respective retention slots
+	retainedSnapshots := categorizeSnapshots(snapshots, instance.Snapshots)
+
+	// Step 2: Delete snapshots that were not retained
+	cleanupSnapshots(ctx, client, snapshots, retainedSnapshots, dryRun)
+
+	return nil
 }
 
-func getAPIEndpoint() v3.Endpoint {
-	envApiEndpoint := os.Getenv("EXOSCALE_API_ENDPOINT")
-	if envApiEndpoint != "" {
-		return v3.Endpoint(envApiEndpoint)
+// Create a new snapshot for an instance
+func createSnapshot(ctx context.Context, client *v3.Client, instanceID v3.UUID, dryRun bool) (v3.UUID, error) {
+	if dryRun {
+		fmt.Println("Dry run: Would create snapshot.")
+		return "dry-run-snapshot-id", nil
+	} else {
+		fmt.Println("Creating snapshot for", instanceID)
 	}
 
-	return defaultEndpoint
+	snapshot, err := client.CreateSnapshot(ctx, instanceID)
+	if err != nil {
+		return "", err
+	}
+
+	return snapshot.ID, nil
+}
+
+// Retrieve existing snapshots for an instance
+func getSnapshots(ctx context.Context, client *v3.Client, instanceID v3.UUID) ([]v3.Snapshot, error) {
+	// Use the correct request type for listing snapshots
+	/*req := &v3.SnapshotListRequest{
+		InstanceID: instanceID,
+	}*/
+
+	snapshots, err := client.ListSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	instanceSnapshots := []v3.Snapshot{}
+
+	for _, snapshot := range snapshots.Snapshots {
+		if snapshot.Instance.ID == instanceID {
+			instanceSnapshots = append(instanceSnapshots, snapshot)
+		}
+	}
+
+	return instanceSnapshots, nil
+}
+
+// Categorize snapshots into hourly, daily, weekly, etc. slots and return the list of retained snapshots
+func categorizeSnapshots(snapshots []v3.Snapshot, retention SnapshotRetention) map[string]struct{} {
+	// Sort snapshots by creation date (newest first)
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].CreatedAT.After(snapshots[j].CreatedAT)
+	})
+
+	// Track retained snapshots by ID
+	retainedSnapshots := make(map[string]struct{})
+
+	// Define the timeframes
+	timeframes := []struct {
+		duration time.Duration
+		limit    int
+	}{
+		{time.Hour, retention.Hourly},
+		{24 * time.Hour, retention.Daily},
+		{7 * 24 * time.Hour, retention.Weekly},
+		{30 * 24 * time.Hour, retention.Monthly},
+		{365 * 24 * time.Hour, retention.Yearly},
+	}
+
+	// Iterate through timeframes and retain snapshots
+	for _, timeframe := range timeframes {
+		retainForTimeframe(snapshots, timeframe.duration, timeframe.limit, retainedSnapshots)
+	}
+
+	return retainedSnapshots
+}
+
+// Retain snapshots for a specific timeframe and update the map of retained snapshots
+func retainForTimeframe(snapshots []v3.Snapshot, timeframe time.Duration, limit int, retainedSnapshots map[string]struct{}) {
+	margin := time.Duration(float64(timeframe) * marginFactor) // 10% margin
+	var lastRetained time.Time
+	retainedCount := 0
+
+	fmt.Printf("Retaining snapshots for %s\n", timeframe)
+
+	for _, snapshot := range snapshots {
+		if _, exists := retainedSnapshots[snapshot.ID.String()]; exists {
+			continue // Skip if this snapshot is already retained
+		}
+
+		created := snapshot.CreatedAT
+		if lastRetained.IsZero() || created.Before(lastRetained.Add(-timeframe+margin)) {
+			// Retain this snapshot if it doesn't violate the minimum distance rule
+			lastRetained = created
+			retainedSnapshots[snapshot.ID.String()] = struct{}{}
+			fmt.Printf("  Retaining %s (%s)\n", snapshot.ID, snapshot.CreatedAT)
+			retainedCount++
+
+			if retainedCount >= limit {
+				break
+			}
+		}
+	}
+}
+
+// Cleanup snapshots that were not retained
+func cleanupSnapshots(ctx context.Context, client *v3.Client, snapshots []v3.Snapshot, retainedSnapshots map[string]struct{}, dryRun bool) {
+	for _, snapshot := range snapshots {
+		// If the snapshot was not retained, delete it
+		if _, retained := retainedSnapshots[snapshot.ID.String()]; !retained {
+			deleteSnapshot(ctx, client, snapshot, dryRun)
+		}
+	}
+}
+
+// Delete a snapshot
+func deleteSnapshot(ctx context.Context, client *v3.Client, snapshot v3.Snapshot, dryRun bool) {
+	if dryRun {
+		fmt.Printf("Dry run: Snapshot %s would be deleted\n", snapshot.ID)
+	} else {
+		op, err := client.DeleteSnapshot(ctx, snapshot.ID)
+		if err != nil {
+			fmt.Printf("Error deleting snapshot %s: %s\n", snapshot.ID, err)
+		} else {
+			_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
+			if err != nil {
+				fmt.Printf("Error deleting snapshot: %s\n", err)
+			} else {
+				fmt.Printf("Deleted snapshot: %s\n", snapshot.ID)
+			}
+		}
+	}
 }
 
 // apiCredentialsFromFile parses a file containing the API credentials.

@@ -3,3 +3,5 @@ dist
 vendor
 /bin
 /go.mk
+config.yaml
+.envrc
