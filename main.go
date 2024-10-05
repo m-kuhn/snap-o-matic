@@ -13,7 +13,7 @@ import (
 
 	v3 "github.com/exoscale/egoscale/v3"
 	"github.com/exoscale/egoscale/v3/credentials"
-	"gopkg.in/yaml.v3" // YAML parsing using yaml.v3
+	"gopkg.in/yaml.v3"
 
 	flag "github.com/spf13/pflag"
 )
@@ -191,11 +191,6 @@ func createSnapshot(ctx context.Context, client *v3.Client, instanceID v3.UUID, 
 
 // Retrieve existing snapshots for an instance
 func getSnapshots(ctx context.Context, client *v3.Client, instanceID v3.UUID) ([]v3.Snapshot, error) {
-	// Use the correct request type for listing snapshots
-	/*req := &v3.SnapshotListRequest{
-		InstanceID: instanceID,
-	}*/
-
 	snapshots, err := client.ListSnapshots(ctx)
 	if err != nil {
 		return nil, err
@@ -244,11 +239,15 @@ func categorizeSnapshots(snapshots []v3.Snapshot, retention SnapshotRetention) m
 
 // Retain snapshots for a specific timeframe and update the map of retained snapshots
 func retainForTimeframe(snapshots []v3.Snapshot, timeframe time.Duration, limit int, retainedSnapshots map[string]struct{}) {
-	margin := time.Duration(float64(timeframe) * marginFactor) // 10% margin
+	margin := time.Duration(float64(timeframe) * marginFactor) // some % margin to account for slight differences in cron run intervals
 	var lastRetained time.Time
 	retainedCount := 0
 
-	fmt.Printf("Retaining snapshots for %s\n", timeframe)
+	fmt.Printf("Retaining %d snapshots for %s\n", limit, timeframe)
+
+	if limit == 0 {
+		return
+	}
 
 	for _, snapshot := range snapshots {
 		if _, exists := retainedSnapshots[snapshot.ID.String()]; exists {
@@ -299,11 +298,11 @@ func deleteSnapshot(ctx context.Context, client *v3.Client, snapshot v3.Snapshot
 	}
 }
 
-// Get the API endpoint
+// Get the API endpoint, prefer env `EXOSCALE_API_ENDPOINT`, fallback to default
 func getAPIEndpoint() v3.Endpoint {
 	endpoint := os.Getenv("EXOSCALE_API_ENDPOINT")
 	if endpoint == "" {
-		return defaultEndpoint // default to predefined endpoint
+		return defaultEndpoint
 	}
 	return v3.Endpoint(endpoint)
 }
